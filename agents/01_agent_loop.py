@@ -159,6 +159,7 @@ def agent_loop(state):
 import os
 import subprocess
 from dataclasses import dataclass
+import json
 
 #增强终端输入体验的主要功能，这是为了修复 macOS 下 libedit 环境中 UTF-8 输入时退格键异常 的问题。
 try:
@@ -205,14 +206,14 @@ TOOLS = [
     }
 ]
 
-# 定义循环状态类（最小化的循环状态类，包含历史记录、循环数、继续执行原因）
+# 定义循环历史状态类（最小化的循环状态类，包含历史记录、循环数、继续执行原因）
 @dataclass
-class LoopState:
+class LoopHistory:
     messages: list
     turn_count: int = 1
     transition_reason: str | None = None
 
-#
+# bash命令执行函数
 def run_bash(command: str) -> str:
     # 一个简易的命令黑名单
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -241,7 +242,7 @@ def run_bash(command: str) -> str:
     # 限制返回长度为50000个字符 如果没有任何输出则输出 无输出
     return output[:50000] if output else "(无输出)"
 
-#
+# 文本处理函数
 def extract_text(content) -> str:
 
     # 判断入参content是否是列表 如果不是列表则返回空字符串
@@ -262,7 +263,7 @@ def extract_text(content) -> str:
     # texts列表中的元素使用换行符拼接 并去除首位空白
     return "\n".join(texts).strip()
 
-#
+# 工具执行函数
 def execute_tool_calls(response_content) -> list[dict]:
 
     # 定义结果列表
@@ -295,35 +296,160 @@ def execute_tool_calls(response_content) -> list[dict]:
     # 返回结果
     return results
 
-def run_one_turn(state: LoopState) -> bool:
+# 大模型调用一个轮次函数
+def run_one_turn(history: LoopHistory) -> bool:
+
+    # 调用大模型 保存返回
     responses = client.messages.create(
-        model=MODEL,
-        system=SYSTEM,
-        messages=state.messages,
-        tools=TOOLS,
-        max_tokens=8000,
+        model=MODEL, # 指定模型类型
+        system=SYSTEM, # 系统提示词
+        messages=history.messages, # 完整历史对话
+        tools=TOOLS, # 模型可用的工具列表
+        max_tokens=8000, # 本次回复最多可生成多少token
     )
 
-    state.messages.append({
+    # 打印大模型返回
+    print("\n===== responses josn=====")
+    print(json.dumps(responses.model_dump(), ensure_ascii=False, indent=2))
+    print("==========================\n")
+
+    # 将模型的回复内容加入历史消息 这样后面的下一轮调用模型时，就能看到这段历史大模型回复
+    history.messages.append({
         "role": "assistant",
         "content": responses.content,
     })
 
+    # 判断大模型是否需要调用工具
     if responses.stop_reason != "tool_use":
-        state.transition_reason = None
+        # 如果此次模型停止原因不是因为要调用工具，将继续执行原因赋值为None
+        history.transition_reason = None
+        # 则返回false 说明这一轮就到这一步为止，不需要继续执行，对话暂时结束
         return False
 
+    # 上一个判断判断了是否需要调用工具 如果上个判断没有走 走到这一步 就相当于模型需要调用工具执行相关操作
+    # 执行工具调用方法 并保存返回结果
     results = execute_tool_calls(responses.content)
 
+    # 如果工具结果为空或者无执行结果，则此轮也无法继续进行，直接结束
     if not results:
-        state.transition_reason = None
+        history.transition_reason = None
         return False
 
-    state.messages.append({
+    # 上一个判断判断了工具执行是否有结果 如果没有则停止 走到这一步说明有结果
+    # 将工具结果作为【用户消息】追加进历史中
+    """
+    这个地方很关键 虽然是一次工具执行的结果，但是需要将其包装成为一条新的【用户消息】加回去，这是很多tool calling协议里常用的做法
+    因为工具结果通常需要作为下一轮输入喂回给模型，而不是作为assistant模型回复喂回给模型
+    你可以这么理解： 相当于用户又把模型的执行结果提交给模型，模型再继续推理， 只不过这个“用户”不再是你自己，而是程序。
+    """
+    history.messages.append({
         "role": "user",
         "content": results
     })
 
-    state.turn_count += 1
-    state.transition_reason = "tool_result"
+    # 循环继续
+    # 历史记录中轮数记录+1
+    history.turn_count += 1
+
+    # 历史记录里记录本次继续循环原因是 使用了工具 并且有返回结果 原因设置为"tool_result"
+    history.transition_reason = "tool_result"
+
+    # 执行完工具之后 继续执行下一轮 因为模型现在已经拿到工具结果了，通常还要再调用一次模型，让它基于工具结果生成最终回答。
+    """
+    用一句话总结这段代码:执行一轮“让模型先说话，如果它要用工具就执行工具，并把工具结果塞回上下文，为下一轮继续生成做准备”的流程。
+    你可以把它理解成这个流程图:
+    用户历史消息  -> 调模型
+                -> 模型回复
+                -> 是否要调用工具？
+                        否 -> 结束，返回 False
+                        是 -> 执行工具
+                            -> 有结果吗？
+                                否 -> 结束，返回 False
+                                是 -> 把工具结果加入消息历史
+                                    -> 返回 True，准备下一轮
+    """
     return True
+
+# 最小心智模型循环 agent的主循环
+def agent_loop(history: LoopHistory) -> None:
+
+    # 不停的执行 上述代码中定义的大模型一个轮次函数 直到返回false为止
+    # 如果函数返回Ture 则pass什么都不做 继续执行下一轮
+    # 如果函数返回False 则循环结束
+    while run_one_turn(history):
+        pass
+
+# 将整个代码应用起来 做一个命令行里的多轮对话程序
+if __name__ == "__main__":
+
+    # 初始化聊天历史 用于保存整个对话历史
+    historyMessage = []
+
+    # 进入死循环，不断等待用户输入
+    while True:
+
+        try:
+
+            query = input("\033[36m01_angent_loop >> \033[0m")
+        # 按键 Ctrl+D 触发EOFError 按键Ctrl+C 触发KeyboardInterrupt
+        except (EOFError, KeyboardInterrupt):
+            # 触发以上两个按键直接退出循环
+            break
+        # 判断是否退出 如果输入匹配到 q quit exit 空字符串 直接退出循环
+        if query.strip().lower() in ("q", "quit", "exit", ""):
+            break
+
+        # 将用户输入加入历史记录
+        historyMessage.append({
+            "role": "user",
+            "content": query
+        })
+
+        # 将当前的聊天记录放进循环历史状态中，初始化agent的运行状态
+        loop_state = LoopHistory(messages=historyMessage)
+
+        # 执行agent主循环
+        agent_loop(loop_state)
+
+        # 最终提取文本 将historyMessage中最后一条的content取出
+        final_text = extract_text(historyMessage[-1]["content"])
+
+        # 如果最终提取文本不为空 则打印出来
+        if final_text:
+            print(final_text)
+        # 额外打印一个空行
+        print()
+
+
+"""
+总结：
+    以上是一个最小的agent的循环流程，提供了大模型调用client、历史会话消息聚合、agent状态管理、交互对话输入输出等功能，实现了一个最小的心智模型
+    总结一下实现的功能点就是：
+    这段代码就是一个终端聊天程序入口：
+    1. 等你输入问题
+    2. 把问题放进聊天历史
+    3. 调 agent 去处理
+    4. 拿到最终回复
+    5. 打印出来
+    6. 继续等你输入下一句
+    
+    相当于以下这样一个流程：
+        启动程序
+          ↓
+        等待用户输入
+          ↓
+        输入 q / exit / 空行？ —— 是 → 退出
+          ↓ 否
+        保存到 history
+          ↓
+        调用 agent_loop(loop_state)
+          ↓
+        agent 跑完整个模型/工具流程
+          ↓
+        取最后一条消息
+          ↓
+        提取文本并打印
+          ↓
+        继续下一轮
+"""
+
