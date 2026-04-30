@@ -275,3 +275,375 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
 
+# -------------------------------------------标准化消息格式------------------------------------------
+"""
+在大模型的历史会话中会存在以下的几种问题：
+1. 历史消息中混入大模型"API不能解析或不兼容的字段"，导致API报错
+2. 解决tool_use没有对应返回tool_result的问题
+3. 解决连续相同角色消息的问题，有些模型API可能不支持连续相同角色交互
+基于以上的问题场景，我们引入了标准化消息格式方法的概念，通过一个函数方法将上述的问题包装成一个函数，用来解决大模型历史消息不标准导致的接口报错问题
+它解决的不是业务逻辑问题，而是 Agent 调用大模型 API 时的消息格式问题。尤其是在带工具调用的 Agent 里，messages 很容易变乱，所以需要这个函数统一清洗。
+
+总结为一句话即为：把历史对话 messages 整理成大模型 API 能正常接收的格式，避免因为消息格式不规范导致接口报错。
+
+问题1：解决消息里混入“API 不认识字段”的问题
+样例JSON：
+{
+    "role": "assistant",
+    "content": [
+        {
+            "type": "text",
+            "text": "我准备调用工具",
+            "_debug": "调试信息",        #--------> 自定义字段
+            "_cost": 123                #--------> 自定义字段
+        }
+    ]
+}
+
+在上述的JSON串种有两个自定义的字段_debug、_cost这种字段可能是你对接的业务系统程序内部消费的字段或提供的字段，在模型的API中是无法消费和解析的，所以我们需要将这种无法解析和消费的字段剔除
+只保留大模型API可解析可消费的字段
+{
+    "role": "assistant",
+    "content": [
+        {
+            "type": "text",
+            "text": "我准备调用工具"
+        }
+    ]
+}
+
+问题2： 解决 tool_use 没有对应 tool_result 的问题 
+在agent循环的过程中 每调用一次工具，都需要得到对应的调用工具的结果，例如以下样例
+样例JSON：这段JSON是一个assistant 请求调用工具，工具调用 ID 是 tool_001
+{
+    "role": "assistant",
+    "content": [
+        {
+            "type": "tool_use",
+            "id": "tool_001",
+            "name": "run_bash",
+            "input": {
+                "command": "ls"
+            }
+        }
+    ]
+}
+正常情况下 这个请求过后后面必须有一个对应的工具结果返回
+{
+    "role": "user",
+    "content": [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool_001",
+            "content": "main.py\nREADME.md"
+        }
+    ]
+}
+非正常情况下，模型会遇到执行工具之后工具报错了，导致没有返回结果或者执行完工具之后，返回的结果为空或其他异常情况。这种情况下都会导致接口异常报错
+所以我们需要处理这种异常的问题
+这个工具的作用就是以下的这个样例情况：
+假设你的历史消息是这样：
+messages = [
+    {
+        "role": "user",
+        "content": "帮我看看当前目录有什么文件"
+    },
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_001",
+                "name": "run_bash",
+                "input": {
+                    "command": "ls"
+                }
+            }
+        ]
+    }
+]
+这表示：
+1. 用户问：“当前目录有什么文件？”
+2. assistant 说：“我要调用工具执行 ls”
+3. 但是后面没有工具执行结果
+这个函数工具会自动补一个执行的工具结果上去
+{
+    "role": "user",
+    "content": [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool_001",
+            "content": "(cancelled)"
+        }
+    ]
+}
+意思是：这个工具调用没有结果，或者已经取消了。
+这样处理前的历史消息就变成了以下的样子
+messages = [
+    {
+        "role": "user",
+        "content": "帮我看看当前目录有什么文件"
+    },
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_001",
+                "name": "run_bash",
+                "input": {
+                    "command": "ls"
+                }
+            }
+        ]
+    },
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool_001",
+                "content": "(cancelled)"
+            }
+        ]
+    }
+]
+这样就解决了assistant 发起了工具调用，但消息历史里没有工具执行结果，导致 API 报错的情况
+
+问题3 解决连续相同角色消息的问题
+有些大模型 API 对消息顺序要求比较严格，通常希望是这种结构：user --> assistant --> user --> assistant 这种用户和助手交替出现的情况
+但是在程序运行的过程中很有可能连续的用户输入出现以下的情况
+messages = [
+    {
+        "role": "user",
+        "content": "你好"
+    },
+    {
+        "role": "user",
+        "content": "帮我写一段 Python 代码"
+    }
+]
+或者这样的回复
+messages = [
+    {
+        "role": "assistant",
+        "content": "好的"
+    },
+    {
+        "role": "assistant",
+        "content": "我来帮你写"
+    }
+]
+这种连续相同角色的消息有些API可能是不支持的 所以我们需要将这种消息做相应的处理
+这个函数工具的解决方案就是将相同的角色消息进行合并处理
+处理之前：
+messages = [
+    {
+        "role": "user",
+        "content": "你好"
+    },
+    {
+        "role": "user",
+        "content": "帮我写一段 Python 代码"
+    }
+]
+处理之后：
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "你好"
+            },
+            {
+                "type": "text",
+                "text": "帮我写一段 Python 代码"
+            }
+        ]
+    }
+]
+将两个消息整合成一个消息，做了合并处理
+
+最后用一个完整的例子来看一下这个工具函数都做了什么操作
+假设原始消息为：
+messages = [
+    {
+        "role": "user",
+        "content": "帮我查看当前目录"
+    },
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": "我来调用工具查看一下",
+                "_debug": "这里是内部调试信息"
+            },
+            {
+                "type": "tool_use",
+                "id": "tool_001",
+                "name": "run_bash",
+                "input": {
+                    "command": "ls"
+                },
+                "_internal": "内部字段"
+            }
+        ]
+    },
+    {
+        "role": "user",
+        "content": "再帮我看看有没有 Python 文件"
+    },
+    {
+        "role": "user",
+        "content": "重点看 .py 后缀的文件"
+    }
+]
+这条消息中显然有以下这几种问题：
+1. 有内部字段 _debug、_internal 
+2. 工具调用没结果 有tool_use，但是没有tool_result
+3. 连续user消息最后两条都是user
+
+经过消息处理工具函数之后会变成以下这种样子：
+[
+    {
+        "role": "user",
+        "content": "帮我查看当前目录"
+    },
+    {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": "我来调用工具查看一下"
+            },
+            {
+                "type": "tool_use",
+                "id": "tool_001",
+                "name": "run_bash",
+                "input": {
+                    "command": "ls"
+                }
+            }
+        ]
+    },
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "再帮我看看有没有 Python 文件"
+            },
+            {
+                "type": "text",
+                "text": "重点看 .py 后缀的文件"
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "tool_001",
+                "content": "(cancelled)"
+            }
+        ]
+    }
+]
+"""
+def format_message(message: list) -> list:
+    # 定义新列表cleaned 用于存放处理后的消息
+    cleaned = []
+
+    # 循环遍历消息列表
+    for item in message:
+        # 将消息中的角色对应的值取出 赋给clean对象中的role字段
+        clean = {"role": item["role"]}
+        # 判断消息列表中元素的content字段是不是字符串
+        if isinstance(item.get("content"), str):
+            # 如果是字符串 则将当前消息列表中的content字段内容赋给clean对象中的content字段
+            clean["content"] = item["content"]
+        elif isinstance(item.get("content"), list):
+
+            # 保留 block 里所有不是 _ 开头的字段
+            clean["content"] = [
+                {key: val for key, val in block.items()
+                if not key.startswith("_")}
+                for block in item["content"]
+                if isinstance(block, dict)
+            ]
+        else:
+            # 其余情况做兜底处理 None赋None值 如果没有content字段则将clean对象中的content字段赋值为""
+            clean["content"] = item.get("content","")
+        # 将处理后的消息添加进新消息列表中
+        cleaned.append(clean)
+
+        # 收集消息列表中已经存在的tool_result
+        # 定义一个set集合来存储工具结果
+        existing_results = set()
+
+        # 循环遍历处理过未知字段的消息列表
+        # 获取工具使用id
+        for msg in cleaned:
+            if isinstance(msg.get("content"), list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        existing_results.add(block.get("tool_use_id"))
+
+        # 给缺失的tool_result补齐占位结果
+        for msg in cleaned:
+            # 如果cleaned消息列表中当前元素的角色不是assistant 或者content的类型不是list
+            if msg["role"] != "assistant" or not isinstance(msg["content"], list):
+                # 跳过 不进行处理
+                continue
+            # 如果msg角色不是assistant并且content类型是一个list则走以下逻辑
+            # 循环遍历msg中的content元素
+            for block in msg["content"]:
+                # 如果content中的元素不是一个 dict字典 则跳过不做处理
+                if not isinstance(block, dict):
+                    continue
+                # 如果content当前元素中的type是tool_use 并且id不存在于已经使用过的工具id set集合中
+                if block.get("type") == "tool_use" and block.get("id") not in existing_results:
+                    # 则说明当前调用的工具没有返回结果 则补充一个占位结果
+                    cleaned.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result",
+                             "tool_use_id": block["id"],
+                             "content": "(cancelled)"
+                             }
+                        ]
+                    })
+
+        # 合并同角色消息
+        # 如果清理后的消息列表是空的 则直接返回
+        if not cleaned:
+            return cleaned
+
+        # 定义一个新的整合消息列表, 先把第一条消息放进去
+        merged = [cleaned[0]]
+
+        # 循环遍历后续消息
+        for msg in cleaned[1:]:
+
+            # 判断当前消息和上一条消息是不是同一个角色
+            if msg["role"] == merged[-1]["role"]:
+
+                prev = merged[-1]
+                prev_content = prev["content"] if isinstance(prev["content"], list) \
+                    else [
+                    {
+                        "type": "text",
+                        "text": str(prev["content"])
+                    }
+                ]
+                curr_content = msg["content"] if isinstance(msg["content"], list) \
+                    else [
+                    {
+                        "type": "text",
+                        "text": str(msg["content"])
+                    }
+                ]
+                prev["content"] = prev_content + curr_content
+            else:
+                merged.append(msg)
+        return merged
+
+
