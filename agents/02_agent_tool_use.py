@@ -74,6 +74,7 @@ for block in response.content:
 import os
 import subprocess
 from pathlib import Path
+import json
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -97,10 +98,10 @@ MODEL = os.environ["MODEL_ID"]
 # SYSTEM系统提示词
 SYSTEM = f"你是一个位于 {WORKDIR} 的编程智能体。使用工具来解决任务。直接行动，不要解释。"
 
+
 # -------------------------------------------安全防护------------------------------------------
 # 路径沙箱函数 --- 把用户传进来的路径做安全校验，防止访问工作目录之外的文件。
 def safe_path(p: str) -> Path:
-
     # (WORKDIR / p)表示拼接路径 例如 WORKDIR = "/app/workspace"， p = "test/a.txt"， (WORKDIR / p) ---> "/app/workspace/test/a.txt"
     # resolve()方法是将路径变成绝对路径
     # 例如 WORKDIR = /app/workspace，p = "../secret.txt"
@@ -131,11 +132,11 @@ def run_bash(command: str) -> str:
     try:
         result = subprocess.run(
             command,
-            shell=True, # 通过shell执行命令
-            cwd=os.getcwd(), # 获取当前工作目录 表示在当前工作目录下执行
-            capture_output=True, # 捕获标准输出 stdout 捕获标准错误 stderr 否则命令输出会直接打印到终端，而不是保存到程序里
-            text=True, # 输出按照文本字符串处理 不是字节流
-            timeout=120, # 执行超时时间
+            shell=True,  # 通过shell执行命令
+            cwd=os.getcwd(),  # 获取当前工作目录 表示在当前工作目录下执行
+            capture_output=True,  # 捕获标准输出 stdout 捕获标准错误 stderr 否则命令输出会直接打印到终端，而不是保存到程序里
+            text=True,  # 输出按照文本字符串处理 不是字节流
+            timeout=120,  # 执行超时时间
         )
     except subprocess.TimeoutExpired:
         return "Error: 运行超时，当前设定超时时间为120s"
@@ -147,6 +148,7 @@ def run_bash(command: str) -> str:
 
     # 限制返回长度为50000个字符 如果没有任何输出则输出 无输出
     return output[:50000] if output else "(无输出)"
+
 
 # 写入文件工具函数 入参path 写入文件路径，content 写进的文本内容
 def run_write_tool(path: str, content: str) -> str:
@@ -162,10 +164,11 @@ def run_write_tool(path: str, content: str) -> str:
 
         # 写文件
         file_path.write_text(content)
-        return f"文件路径 {path} 下写入了 {len(content)} 字节文件"
+        return f"文件路径 {path} 下写入了 {len(content.encode('utf-8'))} 字节文件"
     except Exception as e:
         # 捕获异常并返回
         return f"Error: {e}"
+
 
 # 读取文件工具函数 入参path 读取文件路径；limit 限制读取多少行 默认为None不限制
 def run_read_tool(path: str, limit: int = None) -> str:
@@ -180,7 +183,6 @@ def run_read_tool(path: str, limit: int = None) -> str:
 
         # 如果入参传入了limit限制读取行数值，则判断入参limit是否小于lines读取的总行数
         if limit and limit < len(lines):
-
             # 如果超过了入参limit限制行数，则取前limit行，然后在最后补充提示信息，还有多少行没显示
             lines = lines[:limit] + [f"... (还有 {len(lines) - limit} 未显示)"]
 
@@ -190,6 +192,7 @@ def run_read_tool(path: str, limit: int = None) -> str:
 
         # 捕获异常并返回
         return f"Error: {e}"
+
 
 # 编辑文件工具函数 入参path 文件路径 old_text 老文件 new_text 新文件
 # 打开一个文件，把里面指定的一段旧文本替换成新文本，只替换第一次出现的位置
@@ -204,7 +207,6 @@ def run_edit_tool(path: str, old_text: str, new_text: str) -> str:
 
         # 判断文本内容，看是否有要替换的旧文本
         if old_text not in content:
-
             # 如果当前文本中没有要替换的旧文本内容就返回一段提示
             return f"Error: 在路径 {path} 中没有找到要替换的内容"
 
@@ -218,6 +220,7 @@ def run_edit_tool(path: str, old_text: str, new_text: str) -> str:
 
         # 捕获异常并返回
         return f"Error: {e}"
+
 
 # -------------------------------------------工具并发安全分类------------------------------------------
 # 对工具做并发安全分类，目的是决定：哪些工具可以同时执行，哪些工具必须一个一个串行执行。⚙
@@ -238,9 +241,9 @@ lambda **params 的意思就是定义了一个匿名函数，接收关键字参�
 """
 TOOL_HANDLERS = {
     "bash": lambda **params: run_bash(params["command"]),
-    "read_tool": lambda **params: run_read_tool(params["path"], params["content"]),
-    "write_tool": lambda **params: run_write_tool(params["path"], params["content"]),
-    "edit_tool": lambda **params: run_edit_tool(params["path"], params["old_text"], params["new_text"]),
+    "read_file": lambda **params: run_read_tool(params["path"], params.get("limit")),
+    "write_file": lambda **params: run_write_tool(params["path"], params["content"]),
+    "edit_file": lambda **params: run_edit_tool(params["path"], params["old_text"], params["new_text"]),
 }
 
 # PART 2 工具列表TOOLS
@@ -268,11 +271,15 @@ TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                      "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                                       "new_text": {"type": "string"}},
+                      "required": ["path", "old_text", "new_text"]}},
 ]
 
 # -------------------------------------------标准化消息格式------------------------------------------
@@ -548,6 +555,8 @@ messages = [
     }
 ]
 """
+
+
 def format_message(message: list) -> list:
     # 定义新列表cleaned 用于存放处理后的消息
     cleaned = []
@@ -561,89 +570,221 @@ def format_message(message: list) -> list:
             # 如果是字符串 则将当前消息列表中的content字段内容赋给clean对象中的content字段
             clean["content"] = item["content"]
         elif isinstance(item.get("content"), list):
+            # 定义一个暂存消息列表
+            blocks = []
+            # 循环遍历当前元素中的content字段 根据不同情况做相应处理
+            for block in item["content"]:
+                # 1. 如果已经是 dict，直接使用
+                if isinstance(block, dict):
+                    block_dict = block
+                # 2. 如果是 Anthropic SDK 返回的 TextBlock / ToolUseBlock 对象，转成 dict
+                elif hasattr(block, "model_dump"):
+                    block_dict = block.model_dump(exclude_none=True)
+                # 3. 其他无法识别的对象直接跳过
+                else:
+                    continue
+                # 4. 去掉内部字段
+                block_dict = {
+                    key: val
+                    for key, val in block_dict.items()
+                    if not key.startswith("_")
+                }
 
-            # 保留 block 里所有不是 _ 开头的字段
-            clean["content"] = [
-                {key: val for key, val in block.items()
-                if not key.startswith("_")}
-                for block in item["content"]
-                if isinstance(block, dict)
-            ]
+                # 5. 避免空 block
+                if block_dict:
+                    blocks.append(block_dict)
+            # 处理好之后赋值给content字段
+            clean["content"] = blocks
         else:
             # 其余情况做兜底处理 None赋None值 如果没有content字段则将clean对象中的content字段赋值为""
-            clean["content"] = item.get("content","")
+            clean["content"] = item.get("content", "")
         # 将处理后的消息添加进新消息列表中
         cleaned.append(clean)
 
-        # 收集消息列表中已经存在的tool_result
-        # 定义一个set集合来存储工具结果
-        existing_results = set()
+    # 收集消息列表中已经存在的tool_result
+    # 定义一个set集合来存储工具结果
+    existing_results = set()
 
-        # 循环遍历处理过未知字段的消息列表
-        # 获取工具使用id
-        for msg in cleaned:
-            if isinstance(msg.get("content"), list):
-                for block in msg["content"]:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        existing_results.add(block.get("tool_use_id"))
-
-        # 给缺失的tool_result补齐占位结果
-        for msg in cleaned:
-            # 如果cleaned消息列表中当前元素的角色不是assistant 或者content的类型不是list
-            if msg["role"] != "assistant" or not isinstance(msg["content"], list):
-                # 跳过 不进行处理
-                continue
-            # 如果msg角色不是assistant并且content类型是一个list则走以下逻辑
-            # 循环遍历msg中的content元素
+    # 循环遍历处理过未知字段的消息列表
+    # 获取工具使用id
+    for msg in cleaned:
+        if isinstance(msg.get("content"), list):
             for block in msg["content"]:
-                # 如果content中的元素不是一个 dict字典 则跳过不做处理
-                if not isinstance(block, dict):
-                    continue
-                # 如果content当前元素中的type是tool_use 并且id不存在于已经使用过的工具id set集合中
-                if block.get("type") == "tool_use" and block.get("id") not in existing_results:
-                    # 则说明当前调用的工具没有返回结果 则补充一个占位结果
-                    cleaned.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "tool_result",
-                             "tool_use_id": block["id"],
-                             "content": "(cancelled)"
-                             }
-                        ]
-                    })
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    existing_results.add(block.get("tool_use_id"))
 
-        # 合并同角色消息
-        # 如果清理后的消息列表是空的 则直接返回
-        if not cleaned:
-            return cleaned
+    # 给缺失的tool_result补齐占位结果
+    for msg in cleaned:
+        # 如果cleaned消息列表中当前元素的角色不是assistant 或者content的类型不是list
+        if msg["role"] != "assistant" or not isinstance(msg["content"], list):
+            # 跳过 不进行处理
+            continue
+        # 如果msg角色不是assistant并且content类型是一个list则走以下逻辑
+        # 循环遍历msg中的content元素
+        for block in msg["content"]:
+            # 如果content中的元素不是一个 dict字典 则跳过不做处理
+            if not isinstance(block, dict):
+                continue
+            # 如果content当前元素中的type是tool_use 并且id不存在于已经使用过的工具id set集合中
+            if block.get("type") == "tool_use" and block.get("id") not in existing_results:
+                # 则说明当前调用的工具没有返回结果 则补充一个占位结果
+                cleaned.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result",
+                         "tool_use_id": block["id"],
+                         "content": "(cancelled)"
+                         }
+                    ]
+                })
 
-        # 定义一个新的整合消息列表, 先把第一条消息放进去
-        merged = [cleaned[0]]
+    # 合并同角色消息
+    # 如果清理后的消息列表是空的 则直接返回
+    if not cleaned:
+        return cleaned
+    # 定义一个新的整合消息列表, 先把第一条消息放进去
+    merged = [cleaned[0]]
+    # 循环遍历后续消息
+    for msg in cleaned[1:]:
 
-        # 循环遍历后续消息
-        for msg in cleaned[1:]:
+        # 判断当前消息和上一条消息是不是同一个角色
+        if msg["role"] == merged[-1]["role"]:
+            # 如果是同一个角色 上一条消息暂存位prev
+            prev = merged[-1]
+            # 这里做了一次数据结构转变，如果上一条消息的content字段已经是一个list了 则直接使用；如果不是list则转换为list
+            """
+            转换的list数据结构为
+            [
+                {
+                    "type": "text",
+                    "text": str(prev["content"])
+                }
+            ]
+            """
+            prev_content = prev["content"] if isinstance(prev["content"], list) \
+                else [
+                {
+                    "type": "text",
+                    "text": str(prev["content"])
+                }
+            ]
+            # 当前消息也是同样处理，如果当前消息的content字段是list则直接使用；如果不是则转换为list
+            curr_content = msg["content"] if isinstance(msg["content"], list) \
+                else [
+                {
+                    "type": "text",
+                    "text": str(msg["content"])
+                }
+            ]
+            # 组合消息，将当前消息和前一条消息组合在一起
+            prev["content"] = prev_content + curr_content
+        else:
+            # 如果当前消息和上一条消息角色不同，则不合并直接添加进消息列表中
+            merged.append(msg)
+    # 返回消息列表
+    return merged
 
-            # 判断当前消息和上一条消息是不是同一个角色
-            if msg["role"] == merged[-1]["role"]:
 
-                prev = merged[-1]
-                prev_content = prev["content"] if isinstance(prev["content"], list) \
-                    else [
-                    {
-                        "type": "text",
-                        "text": str(prev["content"])
-                    }
-                ]
-                curr_content = msg["content"] if isinstance(msg["content"], list) \
-                    else [
-                    {
-                        "type": "text",
-                        "text": str(msg["content"])
-                    }
-                ]
-                prev["content"] = prev_content + curr_content
-            else:
-                merged.append(msg)
-        return merged
+# agent循环
+"""
+整个循环可以理解为：模型先回答，如果模型发现自己需要调用工具，就执行工具；工具结果再塞回对话里，让模型继续思考；直到模型不再需要工具，整个循环结束。
+用户提问 → 模型思考 → 模型决定是否调用工具 → 执行工具 → 把工具结果返回给模型 → 模型继续回答 → 直到最终回答完成
+"""
 
 
+def agent_loop(message: list):
+    while True:
+        # 调用大模型 保存返回
+        response = client.messages.create(
+            model=MODEL,  # 指定模型类型
+            system=SYSTEM,  # 系统提示词
+            messages=format_message(message),  # 对完整历史对话进行格式化处理，并返喂给模型
+            tools=TOOLS,  # 模型可用的工具列表
+            max_tokens=8000  # 本次回复最多可生成多少token
+        )
+
+        # 打印大模型返回
+        print("\n===== responses json=====")
+        print(json.dumps(response.model_dump(), ensure_ascii=False, indent=2))
+        print("==========================\n")
+
+        # 将模型的回复内容加入历史消息 这样后面的下一轮调用模型时，就能看到这段历史大模型回复
+        message.append({
+            "role": "assistant",
+            "content": response.content
+        })
+
+        # 重要 退出循环条件 如果模型这次不是要调用工具，而是已经给出最终回答了，就退出 agent_loop。
+        if response.stop_reason != "tool_use":
+            return
+
+        # 定义空列表用于存放工具执行结果
+        result = []
+
+        # 遍历模型回复内容
+        for item in response.content:
+            # 只处理工具调用模块 如果当前模型回复元素item的种类是tool_use则进行下一步处理
+            if item.type == "tool_use":
+                # 根据工具名找到对应的处理函数
+                handler = TOOL_HANDLERS.get(item.name)
+                # 如果找到了对应工具函数则从item中获取入参input 执行工具函数；如果没有找到工具函数则返回未知工具提醒
+                if handler:
+                    try:
+                        output = handler(**item.input)
+                    except Exception as e:
+                        output = f"Error: 工具 {item.name} 执行异常: {type(e).__name__}: {e}"
+                else:
+                    output = f"未知的工具: {item.name}"
+                # 打印工具名称
+                print(f"> {item.name}:")
+                # 打印工具输出执行结果的前200字符
+                print(output[:200])
+                # 组装工具结果，将工具执行结果包装成API可解析的格式
+                result.append({
+                    "type": "tool_result",
+                    "tool_use_id": item.id,
+                    "content": output
+                })
+        # 将工具执行结果的信息作为用户问拼接进历史对话中
+        message.append({
+            "role": "user",
+            "content": result
+        })
+
+
+# 将整个代码应用起来 做一个命令行里的多轮对话程序
+if __name__ == '__main__':
+
+    # 初始化聊天历史 用于保存整个对话历史
+    historyMessage = []
+
+    # 进入死循环，不断等待用户输入
+    while True:
+        try:
+            query = input("\033[36m02_agent_tool_use >> \033[0m")
+        # 按键 Ctrl+D 触发EOFError 按键Ctrl+C 触发KeyboardInterrupt
+        except (EOFError, KeyboardInterrupt):
+            # 触发以上两个按键直接退出循环
+            break
+        # 判断是否退出 如果输入匹配到 q quit exit 空字符串 直接退出循环
+        if query.strip().lower() in ("q", "quit", "exit", ""):
+            break
+        # 将用户输入加入历史记录中
+        historyMessage.append({
+            "role": "user",
+            "content": query
+        })
+        # 执行agent循环
+        agent_loop(historyMessage)
+        # 取出最后一条消息的content
+        response_content = historyMessage[-1]["content"]
+        # 判断模型返回的content是否是一个列表
+        if isinstance(response_content, list):
+            # 如果是列表则进行遍历
+            for msg in response_content:
+                # 判断当前元素是否有text这个属性
+                if hasattr(msg, "text"):
+                    # 如果有 则打印模型回复内容
+                    print(msg.text)
+        # 打印空行
+        print()

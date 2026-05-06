@@ -307,7 +307,7 @@ def run_one_turn(history: LoopHistory) -> bool:
     )
 
     # 打印大模型返回
-    print("\n===== responses josn=====")
+    print("\n===== responses json=====")
     print(json.dumps(responses.model_dump(), ensure_ascii=False, indent=2))
     print("==========================\n")
 
@@ -387,7 +387,6 @@ if __name__ == "__main__":
     while True:
 
         try:
-
             query = input("\033[36m01_angent_loop >> \033[0m")
         # 按键 Ctrl+D 触发EOFError 按键Ctrl+C 触发KeyboardInterrupt
         except (EOFError, KeyboardInterrupt):
