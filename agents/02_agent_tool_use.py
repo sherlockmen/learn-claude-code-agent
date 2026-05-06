@@ -786,3 +786,120 @@ if __name__ == '__main__':
                     print(msg.text)
         # 打印空行
         print()
+
+"""
+总结：
+    以上是一个支持工具调用的 agent 循环流程，在最小 agent loop 的基础上，
+    增加了工具分发表、路径沙箱、文件读写编辑工具、消息格式标准化、工具异常兜底等能力，
+    实现了一个更完整、更安全、更可扩展的本地编程智能体。
+
+    总结一下实现的功能点就是：
+    这段代码就是一个带工具能力的终端智能体程序入口：
+
+    1. 等你在终端输入问题
+    2. 把问题保存到历史会话 historyMessage 中
+    3. 调用 agent_loop 让大模型处理问题
+    4. 如果模型需要使用工具，就返回 tool_use
+    5. 程序根据工具名从 TOOL_HANDLERS 工具分发表里找到对应函数
+    6. 执行 bash、read_file、write_file、edit_file 等工具
+    7. 把工具执行结果包装成 tool_result 返回给模型
+    8. 模型基于工具结果继续生成回答
+    9. 如果模型不再调用工具，就输出最终回复
+    10. 程序继续等待下一轮用户输入
+
+    这份代码相比最小 agent loop，核心增强点有以下几个：
+
+    1. 工具分发表 dispatch map
+       将工具名和真正执行函数绑定起来，例如：
+       bash       -> run_bash
+       read_file  -> run_read_tool
+       write_file -> run_write_tool
+       edit_file  -> run_edit_tool
+
+       这样 agent_loop 主循环不用关心每个工具具体怎么执行，
+       只需要根据模型返回的工具名去 TOOL_HANDLERS 里查找并调用即可。
+
+    2. 路径沙箱 safe_path
+       所有文件读写编辑操作都会先经过 safe_path 校验，
+       确保模型只能操作当前工作目录下的文件，
+       防止模型读取或修改工作目录之外的敏感文件。
+
+    3. 专用工具函数
+       将原本都依赖 bash 完成的能力拆成多个专用工具：
+       - run_bash：执行 shell 命令
+       - run_read_tool：读取文件内容
+       - run_write_tool：写入文件内容
+       - run_edit_tool：替换文件中的指定文本
+
+       每个工具只负责一类事情，职责更清晰，也更方便做安全控制。
+
+    4. 工具说明 TOOLS
+       TOOLS 是提供给大模型看的工具说明书，
+       用来告诉模型当前有哪些工具、每个工具叫什么、需要传什么参数。
+       模型并不会直接执行工具，而是根据 TOOLS 生成 tool_use 请求，
+       真正的执行仍然由本地 Python 代码完成。
+
+    5. 消息格式标准化 format_message
+       在每次调用模型前，会先对历史消息做一次清洗和修正，主要解决三个问题：
+       - 去掉模型 API 不认识的内部字段
+       - 将 SDK 返回的对象转换成普通 dict
+       - 给缺失的 tool_result 补充占位结果
+       - 合并连续相同角色的消息，避免接口不兼容
+
+       这个方法的作用不是处理业务逻辑，
+       而是保证传给大模型 API 的 messages 格式是稳定、合法、可解析的。
+
+    6. 工具异常兜底
+       工具执行时增加了 try except，
+       即使某个工具执行报错，也不会直接导致整个程序中断，
+       而是会把错误信息包装成 tool_result 返回给模型继续处理。
+
+    7. 修复 read_file 可选参数问题
+       read_file 的 limit 参数在 TOOLS 中不是必填参数，
+       所以在 TOOL_HANDLERS 中不能使用 params["limit"] 强制读取，
+       而应该使用 params.get("limit")。
+       这样即使模型只传 path、不传 limit，程序也不会因为 KeyError 中断。
+
+    相当于以下这样一个流程：
+
+        启动程序
+          ↓
+        等待用户输入
+          ↓
+        输入 q / quit / exit / 空行？ —— 是 → 退出
+          ↓ 否
+        保存用户问题到 historyMessage
+          ↓
+        调用 agent_loop(historyMessage)
+          ↓
+        format_message 清洗历史消息
+          ↓
+        调用大模型 client.messages.create
+          ↓
+        模型是否需要调用工具？ —— 否 → 返回最终回复并打印
+          ↓
+          是 → 返回 tool_use
+          ↓
+        根据工具名查找 TOOL_HANDLERS
+          ↓
+        执行对应工具函数
+          ↓
+        将工具结果包装成 tool_result
+          ↓
+        把 tool_result 放回历史消息
+          ↓
+        再次调用模型继续处理
+          ↓
+        直到模型不再调用工具
+          ↓
+        打印最终回复
+          ↓
+        继续下一轮输入
+
+    总体来说：
+    这份代码已经不是一个单纯的聊天程序，
+    而是一个具备工具调用能力的本地 agent 原型。
+    它让大模型负责理解任务和决定使用哪个工具，
+    让 Python 程序负责真正执行工具和控制安全边界，
+    最终形成了“用户输入 -> 模型思考 -> 工具执行 -> 结果反馈 -> 模型继续回答”的完整闭环。
+"""
