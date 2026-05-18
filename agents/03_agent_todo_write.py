@@ -156,3 +156,58 @@ if rounds_since_update >= 3:
         "text": "<reminder>Refresh your plan before continuing.</reminder>",
     })
 """
+
+# ---------------------------------------完整实现----------------------------------------
+import os
+import subprocess
+from pathlib import Path
+
+from anthropic import Anthropic
+from dotenv import load_dotenv
+
+# 获取当前.env文件中的环境变量
+load_dotenv(override=True)
+
+# 如果没有自定义的ANTHROPIC_BASE_URL，就主动清理掉ANTHROPIC_AUTH_TOKEN，防止认证冲突
+if os.getenv("ANTHROPIC_BASE_URL"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+# 获取当前的工作目录 并储存
+WORKDIR = Path.cwd()
+
+# 获取GPT客户端
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+
+# 指定使用模型
+MODEL = os.environ["MODEL_ID"]
+
+# 系统提示词
+SYSTEM = f"""你是一个在 {WORKDIR} 工作目录下运行的编码智能体。
+对于多步骤任务，请使用 todo 工具进行规划。开始处理任务前，将其状态标记为 in_progress；任务完成后，将其状态标记为 completed。
+相比直接用文字描述，优先通过工具完成操作。"""
+
+# ----------------TODO_Manager 轻量级的代办任务列表-------------------
+# 定义一个 TodoManager 类， 用来管理代办任务列表
+class TodoManager:
+
+    # 初始化方法
+    def __init__(self):
+        # self.items 用来保存当前多有的待执行任务
+        # 初始化状态下 待执行任务为空 所以是空列表
+        self.items = []
+
+    # 更新方法，用于更新待执行列表
+    # 入参items是外部传入的任务列表
+    # 出参str是渲染后的任务文本
+    def update(self, items: list) -> str:
+
+        # 长度判断
+        # 如果传入的任务数量超过20个，就抛出异常
+        # 防止待办任务列表太长，不适合展示和管理
+        if len(items) > 20:
+            raise ValueError("待执行列表最多只支持20个待执行任务")
+
+        # validated 用于保存校验通过并整理后的任务
+        validated = []
+
+        # 
